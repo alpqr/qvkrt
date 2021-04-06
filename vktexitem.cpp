@@ -2,6 +2,7 @@
 #include <QtQuick/QQuickWindow>
 #include <QtQuick/QSGTextureProvider>
 #include <QtQuick/QSGSimpleTextureNode>
+#include <QtGui/QVulkanFunctions>
 #include <QtGui/private/qrhi_p.h>
 
 class CustomTextureNode : public QSGTextureProvider, public QSGSimpleTextureNode
@@ -32,12 +33,15 @@ private:
     bool m_initialized = false;
 
     QRhi *m_rhi = nullptr;
+    QVulkanInstance *m_inst = nullptr;
     VkPhysicalDevice m_physDev = VK_NULL_HANDLE;
     VkDevice m_dev = VK_NULL_HANDLE;
     QVulkanDeviceFunctions *m_devFuncs = nullptr;
     QVulkanFunctions *m_funcs = nullptr;
 
-    QRhiTexture *m_texture = nullptr;
+    QRhiTexture *m_owningRhiTexture = nullptr;
+    QSGTexture *m_sgWrapperTexture = nullptr;
+    VkImageView m_outputView = VK_NULL_HANDLE;
 };
 
 CustomTextureItem::CustomTextureItem()
@@ -114,31 +118,22 @@ void CustomTextureNode::createNativeTexture()
 {
     qDebug() << "new texture of size" << m_pixelSize;
 
-    m_texture = m_rhi->newTexture(QRhiTexture::RGBA8, m_pixelSize, 1, QRhiTexture::RenderTarget /* | QRhiTexture::UsedWithLoadStore*/);
-    m_texture->create();
-
-    QSGRendererInterface *rif = m_window->rendererInterface();
-    QRhiSwapChain *sc = reinterpret_cast<QRhiSwapChain *>(
-        rif->getResource(m_window, QSGRendererInterface::RhiSwapchainResource));
-    Q_ASSERT(sc);
-    QRhiCommandBuffer *cb = sc->currentFrameCommandBuffer();
-    Q_ASSERT(cb);
-    QImage image(m_pixelSize, QImage::Format_RGBA8888);
-    image.fill(Qt::red);
-    QRhiResourceUpdateBatch *u = m_rhi->nextResourceUpdateBatch();
-    u->uploadTexture(m_texture, image);
-    cb->resourceUpdate(u);
+    m_owningRhiTexture = m_rhi->newTexture(QRhiTexture::RGBA8, m_pixelSize, 1, QRhiTexture::UsedWithLoadStore);
+    m_owningRhiTexture->create();
 }
 
 void CustomTextureNode::releaseNativeTexture()
 {
-    if (!m_texture)
+    if (!m_owningRhiTexture)
         return;
 
     qDebug() << "destroying texture";
 
-    delete m_texture;
-    m_texture = nullptr;
+    m_devFuncs->vkDestroyImageView(m_dev, m_outputView, nullptr);
+    m_outputView = VK_NULL_HANDLE;
+
+    delete m_owningRhiTexture;
+    m_owningRhiTexture = nullptr;
 }
 
 void CustomTextureNode::sync()
@@ -164,12 +159,12 @@ void CustomTextureNode::sync()
         delete texture();
         releaseNativeTexture();
         createNativeTexture();
-        const QRhiTexture::NativeTexture nativeTexture = m_texture->nativeTexture();
-        QSGTexture *wrapper = QNativeInterface::QSGVulkanTexture::fromNative(VkImage(nativeTexture.object),
-                                                                             VkImageLayout(nativeTexture.layout),
-                                                                             m_window,
-                                                                             m_pixelSize);
-        setTexture(wrapper);
+        const QRhiTexture::NativeTexture nativeTexture = m_owningRhiTexture->nativeTexture();
+        m_sgWrapperTexture = QNativeInterface::QSGVulkanTexture::fromNative(VkImage(nativeTexture.object),
+                                                                            VkImageLayout(nativeTexture.layout),
+                                                                            m_window,
+                                                                            m_pixelSize);
+        setTexture(m_sgWrapperTexture);
     }
 }
 
@@ -183,28 +178,93 @@ void CustomTextureNode::initialize()
         rif->getResource(m_window, QSGRendererInterface::RhiResource));
     Q_ASSERT(m_rhi && m_rhi->backend() == QRhi::Vulkan);
 
-    QVulkanInstance *inst = reinterpret_cast<QVulkanInstance *>(
-                rif->getResource(m_window, QSGRendererInterface::VulkanInstanceResource));
-    Q_ASSERT(inst && inst->isValid());
+    m_inst = reinterpret_cast<QVulkanInstance *>(
+        rif->getResource(m_window, QSGRendererInterface::VulkanInstanceResource));
+    Q_ASSERT(m_inst && m_inst->isValid());
 
     m_physDev = *static_cast<VkPhysicalDevice *>(rif->getResource(m_window, QSGRendererInterface::PhysicalDeviceResource));
     m_dev = *static_cast<VkDevice *>(rif->getResource(m_window, QSGRendererInterface::DeviceResource));
     Q_ASSERT(m_physDev && m_dev);
 
-    m_devFuncs = inst->deviceFunctions(m_dev);
-    m_funcs = inst->functions();
+    m_devFuncs = m_inst->deviceFunctions(m_dev);
+    m_funcs = m_inst->functions();
     Q_ASSERT(m_devFuncs && m_funcs);
 }
-    
-void CustomTextureNode::render()
+
+VkImageLayout doIt(QVulkanInstance *inst,
+                   VkPhysicalDevice physDev,
+                   VkDevice dev,
+                   QVulkanDeviceFunctions *df,
+                   QVulkanFunctions *f,
+                   VkCommandBuffer cb,
+                   VkImage outputImage,
+                   VkImageLayout currentOutputImageLayout,
+                   VkImageView outputImageView,
+                   uint currentFrameSlot)
+{
+
+    return VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+}
+
+void CustomTextureNode::render() // called before Qt Quick starts recording its main render pass
 {
     if (!m_initialized)
         return;
 
     QSGRendererInterface *rif = m_window->rendererInterface();
+    QRhiSwapChain *sc = reinterpret_cast<QRhiSwapChain *>(
+        rif->getResource(m_window, QSGRendererInterface::RhiSwapchainResource));
+    QRhiCommandBuffer *cb = sc->currentFrameCommandBuffer();
+
+    // The underlying VkImage is the same for m_owningRhiTexture and
+    // m_sgWrapperTexture->rhiTexture(), but they themselves are
+    // different QRhiTexture instances, which is relevant for the
+    // setNativeLayout() at the end.
+    QRhiTexture *rhiTex = m_sgWrapperTexture->rhiTexture();
+    const QRhiTexture::NativeTexture nativeTexture = rhiTex->nativeTexture();
+    VkImage rtOutputImage = VkImage(nativeTexture.object);
+    VkImageLayout rtOutputImageLayout = VkImageLayout(nativeTexture.layout);
+
+    const uint currentFrameSlot = m_window->graphicsStateInfo().currentFrameSlot;
+
+    // This is here to ensure that whatever Qt Quick / QRhi has queued
+    // up so far is recorded (not submitted, just recorded).  It would
+    // not be needed if we did everything with native Vulkan calls,
+    // but in this particular application it is relevant because we
+    // use QRhi for convenience (to create textures, buffers).
+    cb->beginExternal();
+
+    // the following two are equivalent, but the latter is a public API whereas the former is not:
+    //VkCommandBuffer cmdBuf = static_cast<const QRhiVulkanCommandBufferNativeHandles *>(cb->nativeHandles())->commandBuffer;
     VkCommandBuffer cmdBuf = *reinterpret_cast<VkCommandBuffer *>(
         rif->getResource(m_window, QSGRendererInterface::CommandListResource));
-    const uint currentFrameSlot = m_window->graphicsStateInfo().currentFrameSlot;
+
+    if (!m_outputView) {
+        VkImageViewCreateInfo viewInfo = {};
+        viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        viewInfo.image = rtOutputImage;
+        viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        viewInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+        viewInfo.components.r = VK_COMPONENT_SWIZZLE_R;
+        viewInfo.components.g = VK_COMPONENT_SWIZZLE_G;
+        viewInfo.components.b = VK_COMPONENT_SWIZZLE_B;
+        viewInfo.components.a = VK_COMPONENT_SWIZZLE_A;
+        viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        viewInfo.subresourceRange.baseMipLevel = 0;
+        viewInfo.subresourceRange.levelCount = 1;
+        viewInfo.subresourceRange.baseArrayLayer = 0;
+        viewInfo.subresourceRange.layerCount = 1;
+        m_devFuncs->vkCreateImageView(m_dev, &viewInfo, nullptr, &m_outputView);
+    }
+
+    VkImageLayout newOutputImageLayout = doIt(m_inst, m_physDev, m_dev, m_devFuncs, m_funcs,
+                                              cmdBuf, rtOutputImage, rtOutputImageLayout, m_outputView,
+                                              currentFrameSlot);
+
+    cb->endExternal();
+
+    // just so QRhi under Qt Quick does not get confused
+    rhiTex->setNativeLayout(newOutputImageLayout);
 }
 
 #include "vktexitem.moc"
