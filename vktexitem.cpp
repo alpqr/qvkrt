@@ -1,4 +1,5 @@
 #include "vktexitem.h"
+#include "rt.h"
 #include <QtQuick/QQuickWindow>
 #include <QtQuick/QSGTextureProvider>
 #include <QtQuick/QSGSimpleTextureNode>
@@ -32,16 +33,19 @@ private:
 
     bool m_initialized = false;
 
-    QRhi *m_rhi = nullptr;
     QVulkanInstance *m_inst = nullptr;
     VkPhysicalDevice m_physDev = VK_NULL_HANDLE;
     VkDevice m_dev = VK_NULL_HANDLE;
     QVulkanDeviceFunctions *m_devFuncs = nullptr;
     QVulkanFunctions *m_funcs = nullptr;
 
-    QRhiTexture *m_owningRhiTexture = nullptr;
-    QSGTexture *m_sgWrapperTexture = nullptr;
+    VkImage m_output = VK_NULL_HANDLE;
+    VkImageLayout m_outputLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkDeviceMemory m_outputMemory = VK_NULL_HANDLE;
     VkImageView m_outputView = VK_NULL_HANDLE;
+    QSGTexture *m_sgWrapperTexture = nullptr;
+
+    Raytracing raytracing;
 };
 
 CustomTextureItem::CustomTextureItem()
@@ -103,8 +107,6 @@ CustomTextureNode::CustomTextureNode(QQuickItem *item)
 
 CustomTextureNode::~CustomTextureNode()
 {
-    // ###
-
     delete texture();
     releaseNativeTexture();
 }
@@ -118,28 +120,89 @@ void CustomTextureNode::createNativeTexture()
 {
     qDebug() << "new texture of size" << m_pixelSize;
 
-    m_owningRhiTexture = m_rhi->newTexture(QRhiTexture::RGBA8, m_pixelSize, 1, QRhiTexture::UsedWithLoadStore);
-    m_owningRhiTexture->create();
+    m_outputLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+    VkImageCreateInfo imageInfo = {};
+    imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    imageInfo.flags = 0;
+    imageInfo.imageType = VK_IMAGE_TYPE_2D;
+    imageInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+    imageInfo.extent.width = uint32_t(m_pixelSize.width());
+    imageInfo.extent.height = uint32_t(m_pixelSize.height());
+    imageInfo.extent.depth = 1;
+    imageInfo.mipLevels = 1;
+    imageInfo.arrayLayers = 1;
+    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    imageInfo.initialLayout = m_outputLayout;
+    imageInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+
+    m_devFuncs->vkCreateImage(m_dev, &imageInfo, nullptr, &m_output);
+
+    VkMemoryRequirements memReq;
+    m_devFuncs->vkGetImageMemoryRequirements(m_dev, m_output, &memReq);
+    quint32 memIndex = 0;
+    VkPhysicalDeviceMemoryProperties physDevMemProps;
+    m_funcs->vkGetPhysicalDeviceMemoryProperties(m_physDev, &physDevMemProps);
+    for (uint32_t i = 0; i < physDevMemProps.memoryTypeCount; ++i) {
+        if (!(memReq.memoryTypeBits & (1 << i)))
+            continue;
+        if (physDevMemProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) {
+            memIndex = i;
+            break;
+        }
+    }
+
+    VkMemoryAllocateInfo allocInfo = {
+        VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        nullptr,
+        memReq.size,
+        memIndex
+    };
+
+    m_devFuncs->vkAllocateMemory(m_dev, &allocInfo, nullptr, &m_outputMemory);
+    m_devFuncs->vkBindImageMemory(m_dev, m_output, m_outputMemory, 0);
+
+    VkImageViewCreateInfo viewInfo = {};
+    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    viewInfo.image = m_output;
+    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+    viewInfo.components.r = VK_COMPONENT_SWIZZLE_R;
+    viewInfo.components.g = VK_COMPONENT_SWIZZLE_G;
+    viewInfo.components.b = VK_COMPONENT_SWIZZLE_B;
+    viewInfo.components.a = VK_COMPONENT_SWIZZLE_A;
+    viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    viewInfo.subresourceRange.baseMipLevel = 0;
+    viewInfo.subresourceRange.levelCount = 1;
+    viewInfo.subresourceRange.baseArrayLayer = 0;
+    viewInfo.subresourceRange.layerCount = 1;
+    m_devFuncs->vkCreateImageView(m_dev, &viewInfo, nullptr, &m_outputView);
 }
 
 void CustomTextureNode::releaseNativeTexture()
 {
-    if (!m_owningRhiTexture)
+    if (!m_output)
         return;
 
     qDebug() << "destroying texture";
 
+    m_devFuncs->vkDeviceWaitIdle(m_dev);
+
     m_devFuncs->vkDestroyImageView(m_dev, m_outputView, nullptr);
     m_outputView = VK_NULL_HANDLE;
 
-    delete m_owningRhiTexture;
-    m_owningRhiTexture = nullptr;
+    m_devFuncs->vkDestroyImage(m_dev, m_output, nullptr);
+    m_output = VK_NULL_HANDLE;
+
+    m_devFuncs->vkFreeMemory(m_dev, m_outputMemory, nullptr);
+    m_outputMemory = VK_NULL_HANDLE;
 }
 
 void CustomTextureNode::sync()
 {
     m_dpr = m_window->effectiveDevicePixelRatio();
-    const QSize newSize = m_window->size() * m_dpr;
+    const QSize newSize = m_item->size().toSize() * m_dpr;
     bool needsNew = false;
 
     if (!texture())
@@ -159,9 +222,8 @@ void CustomTextureNode::sync()
         delete texture();
         releaseNativeTexture();
         createNativeTexture();
-        const QRhiTexture::NativeTexture nativeTexture = m_owningRhiTexture->nativeTexture();
-        m_sgWrapperTexture = QNativeInterface::QSGVulkanTexture::fromNative(VkImage(nativeTexture.object),
-                                                                            VkImageLayout(nativeTexture.layout),
+        m_sgWrapperTexture = QNativeInterface::QSGVulkanTexture::fromNative(m_output,
+                                                                            m_outputLayout,
                                                                             m_window,
                                                                             m_pixelSize);
         setTexture(m_sgWrapperTexture);
@@ -170,14 +232,9 @@ void CustomTextureNode::sync()
 
 void CustomTextureNode::initialize()
 {
-    const int framesInFlight = m_window->graphicsStateInfo().framesInFlight;
     m_initialized = true;
 
     QSGRendererInterface *rif = m_window->rendererInterface();
-    m_rhi = reinterpret_cast<QRhi *>(
-        rif->getResource(m_window, QSGRendererInterface::RhiResource));
-    Q_ASSERT(m_rhi && m_rhi->backend() == QRhi::Vulkan);
-
     m_inst = reinterpret_cast<QVulkanInstance *>(
         rif->getResource(m_window, QSGRendererInterface::VulkanInstanceResource));
     Q_ASSERT(m_inst && m_inst->isValid());
@@ -189,21 +246,8 @@ void CustomTextureNode::initialize()
     m_devFuncs = m_inst->deviceFunctions(m_dev);
     m_funcs = m_inst->functions();
     Q_ASSERT(m_devFuncs && m_funcs);
-}
 
-VkImageLayout doIt(QVulkanInstance *inst,
-                   VkPhysicalDevice physDev,
-                   VkDevice dev,
-                   QVulkanDeviceFunctions *df,
-                   QVulkanFunctions *f,
-                   VkCommandBuffer cb,
-                   VkImage outputImage,
-                   VkImageLayout currentOutputImageLayout,
-                   VkImageView outputImageView,
-                   uint currentFrameSlot)
-{
-
-    return VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    raytracing.init(m_physDev, m_dev, m_funcs, m_devFuncs);
 }
 
 void CustomTextureNode::render() // called before Qt Quick starts recording its main render pass
@@ -212,59 +256,17 @@ void CustomTextureNode::render() // called before Qt Quick starts recording its 
         return;
 
     QSGRendererInterface *rif = m_window->rendererInterface();
-    QRhiSwapChain *sc = reinterpret_cast<QRhiSwapChain *>(
-        rif->getResource(m_window, QSGRendererInterface::RhiSwapchainResource));
-    QRhiCommandBuffer *cb = sc->currentFrameCommandBuffer();
-
-    // The underlying VkImage is the same for m_owningRhiTexture and
-    // m_sgWrapperTexture->rhiTexture(), but they themselves are
-    // different QRhiTexture instances, which is relevant for the
-    // setNativeLayout() at the end.
-    QRhiTexture *rhiTex = m_sgWrapperTexture->rhiTexture();
-    const QRhiTexture::NativeTexture nativeTexture = rhiTex->nativeTexture();
-    VkImage rtOutputImage = VkImage(nativeTexture.object);
-    VkImageLayout rtOutputImageLayout = VkImageLayout(nativeTexture.layout);
 
     const uint currentFrameSlot = m_window->graphicsStateInfo().currentFrameSlot;
 
-    // This is here to ensure that whatever Qt Quick / QRhi has queued
-    // up so far is recorded (not submitted, just recorded).  It would
-    // not be needed if we did everything with native Vulkan calls,
-    // but in this particular application it is relevant because we
-    // use QRhi for convenience (to create textures, buffers).
-    cb->beginExternal();
-
-    // the following two are equivalent, but the latter is a public API whereas the former is not:
-    //VkCommandBuffer cmdBuf = static_cast<const QRhiVulkanCommandBufferNativeHandles *>(cb->nativeHandles())->commandBuffer;
     VkCommandBuffer cmdBuf = *reinterpret_cast<VkCommandBuffer *>(
         rif->getResource(m_window, QSGRendererInterface::CommandListResource));
 
-    if (!m_outputView) {
-        VkImageViewCreateInfo viewInfo = {};
-        viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-        viewInfo.image = rtOutputImage;
-        viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        viewInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
-        viewInfo.components.r = VK_COMPONENT_SWIZZLE_R;
-        viewInfo.components.g = VK_COMPONENT_SWIZZLE_G;
-        viewInfo.components.b = VK_COMPONENT_SWIZZLE_B;
-        viewInfo.components.a = VK_COMPONENT_SWIZZLE_A;
-        viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        viewInfo.subresourceRange.baseMipLevel = 0;
-        viewInfo.subresourceRange.levelCount = 1;
-        viewInfo.subresourceRange.baseArrayLayer = 0;
-        viewInfo.subresourceRange.layerCount = 1;
-        m_devFuncs->vkCreateImageView(m_dev, &viewInfo, nullptr, &m_outputView);
-    }
+    m_outputLayout = raytracing.doIt(m_inst, m_physDev, m_dev, m_devFuncs, m_funcs,
+                                     cmdBuf, m_output, m_outputLayout, m_outputView,
+                                     currentFrameSlot, m_pixelSize);
 
-    VkImageLayout newOutputImageLayout = doIt(m_inst, m_physDev, m_dev, m_devFuncs, m_funcs,
-                                              cmdBuf, rtOutputImage, rtOutputImageLayout, m_outputView,
-                                              currentFrameSlot);
-
-    cb->endExternal();
-
-    // just so QRhi under Qt Quick does not get confused
-    rhiTex->setNativeLayout(newOutputImageLayout);
+    //m_sgWrapperTexture->rhiTexture()->setNativeLayout(m_outputLayout);
 }
 
 #include "vktexitem.moc"

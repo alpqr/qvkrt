@@ -9,8 +9,9 @@ int main(int argc, char *argv[])
 
     QQuickWindow::setGraphicsApi(QSGRendererInterface::Vulkan);
 
-    // manage our own Vulkan instance because the default one that would be
-    // created by Qt Quick does not enable post-1.0 version stuff
+    // ### there really should be built-in enablers for this
+    // Manage our own Vulkan instance because the default one that would be
+    // created by Qt Quick does not enable post-1.0 version stuff.
     QVulkanInstance inst;
     inst.setApiVersion({ 1, 2 });
     inst.setExtensions(QQuickGraphicsConfiguration::preferredInstanceExtensions());

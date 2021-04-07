@@ -15,6 +15,7 @@ find_package(Qt6 COMPONENTS Quick)
 qt6_add_executable(qvkrt
     main.cpp
     vktexitem.cpp vktexitem.h
+    rt.cpp rt.h
 )
 target_link_libraries(qvkrt PUBLIC
     Qt::Core
@@ -26,6 +27,9 @@ target_link_libraries(qvkrt PUBLIC
 
 set(qvkrt_resource_files
     "main.qml"
+    "raygen.rgen.spv"
+    "miss.rmiss.spv"
+    "closesthit.rchit.spv"
 )
 
 qt6_add_resources(qvkrt "qvkrt"
