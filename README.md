@@ -7,14 +7,16 @@ texture and use the texture with an Item, this part is fairly similar to the
 https://doc-snapshots.qt.io/qt6-dev/qtquick-scenegraph-vulkantextureimport-example.html
 example)
 
-The result is the classic triangle, based on
+The result is a classic triangle, completely static for now, based on
 https://github.com/SaschaWillems/Vulkan/blob/master/examples/raytracingbasic/raytracingbasic.cpp
 and https://nvpro-samples.github.io/vk_raytracing_tutorial_KHR/
 although modified here and there.
 
+![Screenshot](screenshot.png)
+
 QRhi's double buffering (2 frames in flight) is handled more or less correctly,
-and the window should also resize without breaking. Some resources are not
-cleaned up, hence the validation layer warnings when exiting.
+but window resizing may break. Some resources are not cleaned up, hence the
+validation layer warnings when exiting.
 
 Needs an NVIDIA RTX card, recent drivers, a recent Vulkan SDK, and a patched Qt
 dev (6.2), although 6.1 might work too. In any case,
@@ -47,5 +49,3 @@ way to enable the extra features on the VkDevice:
 +
 +        //devInfo.pEnabledFeatures = &features;
 ```
-
-![Screenshot](screenshot.png)

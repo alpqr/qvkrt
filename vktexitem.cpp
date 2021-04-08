@@ -4,7 +4,7 @@
 #include <QtQuick/QSGTextureProvider>
 #include <QtQuick/QSGSimpleTextureNode>
 #include <QtGui/QVulkanFunctions>
-#include <QtGui/private/qrhi_p.h>
+//#include <QtGui/private/qrhi_p.h>
 
 class CustomTextureNode : public QSGTextureProvider, public QSGSimpleTextureNode
 {

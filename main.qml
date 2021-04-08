@@ -25,6 +25,14 @@ Rectangle {
         }
     }
 
+    // update the raytraced content ca. every 100 ms (not that it matters much since it's all static for now)
+    Timer {
+        interval: 100
+        repeat: true
+        running: true
+        onTriggered: rt.update()
+    }
+
     SequentialAnimation {
         PauseAnimation { duration: 2000 }
         ParallelAnimation {
@@ -44,13 +52,6 @@ Rectangle {
         running: true
         loops: Animation.Infinite
     }
-
-//    Timer {
-//        interval: 100
-//        repeat: true
-//        running: true
-//        onTriggered: rt.update()
-//    }
 
     Text {
         color: "#ffffff"
